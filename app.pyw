@@ -1,12 +1,14 @@
 """云端保险箱 — one-click personal backup UI."""
-import ctypes, json, os, queue, subprocess, sys, threading, time, traceback, webbrowser
+import ctypes, json, os, sys, time, webbrowser
 from pathlib import Path
 from collections import deque
 from configuration import app_home, load_config
 import tkinter as tk
 from tkinter import ttk, messagebox
 try:
-    from engine import Engine, Paused, BackupError, read_json, atomic_json, now
+    from engine import BackupError, read_json
+    from background import BackgroundClient, worker_active, safe_read
+    from selection import FileSelection
 except ImportError:
     if os.name=='nt':ctypes.windll.user32.MessageBoxW(None,'缺少 Python 组件。请先运行 install.ps1 安装依赖。','云端保险箱 · 启动失败',16)
     raise SystemExit(1)
@@ -58,10 +60,11 @@ class UploadEstimate:
         return rate,remaining/rate,None
 
 class Window:
-    def __init__(self, preview=False, config=None):
+    def __init__(self, preview=False, config=None, config_path=None):
         self.config = config or {'repo':'example/private-backup','roots':[], 'state_dir':str(app_home()/'preview')}
-        self.events = queue.Queue(); self.cancel = threading.Event(); self.running = False; self.stats = {}; self.preview = preview
-        self.closing=False;self.worker=None
+        self.running = False; self.stats = {}; self.preview = preview
+        self.closing=False;self.client=None;self.config_path=config_path;self.selection_window=None;self.last_review=None
+        self.backend_phase=-1;self.backend_log=0;self.last_backend_poll=0;self.started_at=0
         self.eta_meter=UploadEstimate();self.last_refresh=0
         self.root = tk.Tk(); self.root.title('云端保险箱 · GitHub 增量备份')
         self.root.configure(bg=BG)
@@ -109,51 +112,65 @@ class Window:
             tk.Button(actions,text=label,command=command,bg='#20324c',fg=TEXT,activebackground='#2a4262',activeforeground=TEXT,relief='flat',padx=15,pady=10,cursor='hand2').pack(side='left',padx=(10,0))
         tk.Label(self.root,text='AES-256 加密  ·  分包续传  ·  上传后核对 SHA-256  ·  保留历史版本',bg=BG,fg=MUTED,font=('Microsoft YaHei UI',8)).pack(pady=(0,14))
         self.root.protocol('WM_DELETE_WINDOW',self.close);self.root.after(100,self.poll)
+        self.root.bind('<Unmap>',self.minimized)
         if preview: self.demo()
         else:self.root.after(700,self.start)
-    def emit(self,kind,value):self.events.put((kind,value))
     def log(self,text):
         self.logbox.configure(state='normal');self.logbox.insert('end',time.strftime('%H:%M:%S')+'  '+text+'\n');self.logbox.see('end');self.logbox.configure(state='disabled')
     def start(self):
         if self.running:return
-        self.running=True;self.cancel.clear();self.stats={};self.eta_meter=UploadEstimate();self.button.configure(text='暂停备份',state='normal');self.check.configure(state='disabled')
+        if not self.config_path:
+            messagebox.showinfo('预览模式','这是界面预览，请正常启动程序以配置备份。',parent=self.root);return
+        self.running=True;self.stats={};self.eta_meter=UploadEstimate();self.button.configure(text='暂停备份',state='normal');self.check.configure(state='disabled')
+        self.backend_phase=-1;self.backend_log=0;self.last_review=None;self.started_at=time.monotonic()
         self.bar.configure(mode='indeterminate');self.bar.start(12);deep=self.deep.get()
-        def worker():
-            try:
-                if os.name=='nt':ctypes.windll.kernel32.SetThreadExecutionState(0x80000001)
-                Engine(self.config,self.emit,self.cancel).run(deep)
-            except Paused:
-                atomic_json(Path(self.config['state_dir'])/'last-report.json',{'status':'paused','finished':now(),'runs':[]})
-                self.emit('paused','进度已保存，下次继续时会跳过已校验的分包。')
-            except Exception as ex:
-                # Traceback contains code locations/errors only, never GitHub credentials.
-                folder=Path(self.config['state_dir']);folder.mkdir(parents=True,exist_ok=True)
-                (folder/'last-error.log').write_text(traceback.format_exc(),encoding='utf8')
-                atomic_json(folder/'last-report.json',{'status':'error','finished':now(),'error':str(ex),'runs':[]})
-                self.emit('error',str(ex) or type(ex).__name__)
-            finally:
-                if os.name=='nt':ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
-        self.worker=threading.Thread(target=worker,daemon=True);self.worker.start()
-    def toggle(self):
-        if self.running:self.cancel.set();self.phase.set('正在安全暂停…');self.button.configure(state='disabled')
-        else:self.start()
-    def poll(self):
         try:
-            while True:
-                kind,value=self.events.get_nowait()
-                if kind=='phase':
-                    self.stats={};self.eta_meter=UploadEstimate();self.phase.set(value);self.log(value)
-                    self.values['eta'].set('测算中');self.values['speed'].set('—')
-                elif kind=='log':self.log(value)
-                elif kind=='stats':
-                    self.stats.update(value)
-                    if 'wire_bytes' in value:self.eta_meter.observe(value['wire_bytes'])
-                    self.render_stats()
-                elif kind in ('done','error','paused'):self.finish(kind,value)
-        except queue.Empty:pass
-        if self.closing and self.worker and not self.worker.is_alive():self.root.destroy();return
-        if self.running and time.monotonic()-self.last_refresh>=1:
-            self.render_stats();self.last_refresh=time.monotonic()
+            self.client=BackgroundClient(self.config_path,self.config['state_dir'])
+            created=self.client.start(deep)
+            self.phase.set('独立后台任务已启动' if created else '已连接正在运行的后台任务')
+            self.log('最小化窗口后继续扫描和上传；扫描完成后需确认文件选择。')
+        except Exception as ex:self.finish('error',str(ex))
+    def toggle(self):
+        if self.running:
+            self.client.pause();self.phase.set('正在安全暂停…');self.button.configure(state='disabled')
+        else:self.start()
+    def minimized(self,event):
+        if event.widget==self.root and self.running:self.root.title('云端保险箱 · 后台任务继续运行')
+    def poll_backend(self):
+        value=self.client.status()
+        if not value:
+            if self.client.process and self.client.process.poll() is not None:
+                self.finish('error','后台进程未能启动，请检查配置、运行环境及 last-error.log。')
+            elif time.monotonic()-self.started_at>15 and not worker_active(self.config['state_dir']):
+                self.finish('error','后台任务启动超时，未推进备份索引；可以重试。')
+            return
+        if value['phase_id']!=self.backend_phase:
+            self.backend_phase=value['phase_id'];self.stats={};self.eta_meter=UploadEstimate();self.phase.set(value['phase'])
+            self.values['eta'].set('测算中');self.values['speed'].set('—');self.log(value['phase'])
+        for number,line in value.get('logs',[]):
+            if number>self.backend_log:self.log(line);self.backend_log=number
+        self.stats.update(value.get('stats',{}))
+        if 'wire_bytes' in self.stats:self.eta_meter.observe(self.stats['wire_bytes'])
+        if value['status'] in ('done','error','paused'):
+            self.finish(value['status'],value['result']);return
+        request_id=value.get('review_id')
+        if request_id and request_id!=self.last_review:
+            request=safe_read(Path(self.config['state_dir'])/'selection-request.json',{})
+            if request.get('run_id')==self.client.run_id and request.get('request_id')==request_id:
+                self.last_review=request_id;self.root.deiconify();self.root.lift()
+                self.selection_window=FileSelection(self.root,request,self.client.approve,self.toggle)
+        age=time.time()-value.get('heartbeat',0)
+        if age>5:
+            if not worker_active(self.config['state_dir']):
+                self.finish('error','后台任务意外结束，已完成分包保留；重新开始即可续传。');return
+            self.phase.set('后台进程仍在运行 · 等待状态更新')
+        self.render_stats()
+    def poll(self):
+        if self.running and self.client and time.monotonic()-self.last_backend_poll>=1:
+            try:self.poll_backend()
+            except (OSError,ValueError) as ex:self.phase.set('等待后台状态同步…')
+            self.last_backend_poll=time.monotonic()
+        if self.closing and not self.running:self.root.destroy();return
         self.root.after(150,self.poll)
     def render_stats(self):
         s=self.stats
@@ -162,14 +179,18 @@ class Window:
         if s.get('stage')!='upload' and 'estimate' in s:
             self.values['eta'].set('约 '+duration(s['estimate']))
             self.detail.set('这是按历史速度粗估的上传耗时；文件准备完成后，将按实际速度动态更新。')
-        if s.get('stage')=='upload':
+        if s.get('stage')=='review':
+            self.bar.stop();self.values['eta'].set('等待选择');self.values['speed'].set('—')
+            self.detail.set('请在文件选择窗口勾选本次要上传的内容。确认前不会封包上传。')
+            self.progress_text.set('扫描完成 · 等待你的确认')
+        elif s.get('stage')=='upload':
             _,eta,status=self.eta_meter.read(s.get('total',0),s.get('uploaded',0),s.get('inflight',0),s.get('retrying',False))
             rate=self.eta_meter.speed()
             self.values['speed'].set(size(rate)+'/s')
             self.values['eta'].set(status or duration(eta))
             self.bar.stop();self.bar.configure(mode='determinate');total=max(s.get('total',1),1)
             self.bar['value']=min(99.9,(s.get('uploaded',0)+s.get('inflight',0))/total*100)
-            self.detail.set('速度每秒更新；剩余时间按近 15 秒均速估算，最终校验耗时另计。网络中断会自动重试。')
+            self.detail.set('独立后台进程正在上传，最小化不会暂停。速度每秒更新；剩余时间按近 15 秒均速估算。')
             self.progress_text.set(f'已校验 {size(s.get("uploaded",0))} / {size(total)}   ·   当前包 {size(s.get("inflight",0))}')
         elif 'packed' in s:self.progress_text.set(f'已加密并校验 {s["packed"]} / {s["pack_total"]} 个分包')
         elif 'staged' in s:self.progress_text.set(f'已处理 {s["staged"]:,} / {s["stage_total"]:,} 个候选变动文件')
@@ -177,12 +198,20 @@ class Window:
     def finish(self,kind,value):
         self.running=False;self.bar.stop();self.button.configure(text='继续 / 再次检查',state='normal');self.check.configure(state='normal')
         self.values['speed'].set('—')
+        if self.selection_window:
+            try:self.selection_window.window.destroy()
+            except tk.TclError:pass
+            self.selection_window=None
+        self.root.title('云端保险箱 · '+('备份完成' if kind=='done' else '任务已暂停或未完成'))
+        if not self.closing and not self.preview:self.root.deiconify();self.root.lift()
         if kind=='done':
             count=sum(r.get('files',0) for r in value['runs']);issues=sum(len(r.get('issues',[])) for r in value['runs'])
             self.values['files'].set(f'{count:,} 个');self.values['eta'].set('已完成');self.bar.configure(mode='determinate');self.bar['value']=100
             removed=sum(r.get('deleted',0) for r in value['runs'])
             message=f'本轮完成：{count:,} 个新增或修改文件。' if count else '没有需要上传的新文件内容。'
             if removed:message+=f'\n已记录 {removed} 项删除，云端历史仍保留。'
+            skipped=sum(r.get('unselected',0) for r in value['runs'])
+            if skipped:message+=f'\n本次未勾选 {skipped:,} 个文件，下次扫描仍会显示。'
             if issues:message+=f'\n有 {issues} 项未能读取或需要检查，详情见报告。'
             self.phase.set('备份完成 · 有待检查项' if issues else '备份完成');self.detail.set(message);self.progress_text.set('任务结束，已释放自动休眠限制。');self.log(message)
             if not self.preview and not self.closing:(messagebox.showwarning if issues else messagebox.showinfo)('云端保险箱',message,parent=self.root)
@@ -213,13 +242,13 @@ class Window:
     def close(self):
         if self.closing:return
         if self.running and not messagebox.askyesno('保存进度并退出','现在退出会暂停本轮任务。下次双击自动续传，已上传内容不会丢失。\n\n保存进度并退出？',parent=self.root):return
-        self.cancel.set()
-        if self.worker and self.worker.is_alive():
+        if self.running and self.client:
+            self.client.pause()
             self.closing=True;self.button.configure(state='disabled');self.phase.set('正在保存进度并退出…')
             self.detail.set('正在等待当前网络请求结束，窗口会自动关闭。')
         else:self.root.destroy()
     def demo(self):
-        self.phase.set('已准备好 · 双击即开始');self.detail.set('自动扫描所选目录，使用你自己的私密仓库和恢复密钥。');self.progress_text.set('支持网络重试、退出续传和完成弹窗。')
+        self.phase.set('已准备好 · 双击即开始');self.detail.set('后台扫描 → 勾选文件 → 加密上传。最小化窗口时后台任务继续运行。');self.progress_text.set('支持网络重试、退出续传和完成弹窗。')
         self.button.configure(text='开始备份');self.log('预览模式：没有扫描或上传个人文件。')
 
 def main():
@@ -247,7 +276,7 @@ def main():
         except BackupError:
             r=tk.Tk();r.withdraw();messagebox.showinfo('云端保险箱','备份窗口已经在运行，请切换到已有窗口。');r.destroy();return
     try:
-        window=Window(preview,config)
+        window=Window(preview,config,args.config if not preview else None)
         if args.ui_check:
             window.root.update();print(json.dumps({'width':window.root.winfo_width(),'height':window.root.winfo_height(),'widgets':len(window.root.winfo_children())}));window.root.destroy()
         else:window.root.mainloop()

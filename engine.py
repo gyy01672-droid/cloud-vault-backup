@@ -324,13 +324,23 @@ class Engine:
         return changed, deleted, issues, excluded
     def make_snapshot(self, deep=False):
         rows, deleted, issues, excluded = self.scan(deep)
+        unselected=0
+        selector=getattr(self,'select_files',None)
+        if rows and selector:
+            for row in rows:row['selection_id']=hashlib.sha256(norm(row['source']).encode()).hexdigest()
+            selected=set(selector(rows))
+            allowed={row['selection_id'] for row in rows}
+            if not selected.issubset(allowed):raise BackupError('文件选择中包含未知项，未开始备份。')
+            unselected=len(rows)-len(selected);rows=[row for row in rows if row['selection_id'] in selected]
+            if not rows:
+                return None,{'status':'warning' if issues else 'unchanged','files':0,'issues':issues,'excluded':excluded,'unselected':unselected,'finished':now()}
         if not rows and not deleted:
             return None, {'status': 'warning' if issues else 'unchanged', 'files': 0, 'issues': issues, 'excluded': excluded, 'finished': now()}
         tag = 'increment-' + dt.datetime.now(UTC).strftime('%Y%m%d-%H%M%S') + '-' + uuid.uuid4().hex[:8]
         folder = self.runs / tag; folder.mkdir()
         snapshot = {'version': 2, 'tag': tag, 'created': now(), 'status': 'building', 'selected': rows, 'deleted': deleted,
                     'issues': issues, 'files': [], 'assets': [], 'excluded': excluded, 'repo': self.c['repo'], 'key_id': self.identity['key_id'],
-                    'parent_tag':self.index.last_tag()}
+                    'parent_tag':self.index.last_tag(),'unselected':unselected}
         atomic_json(folder / 'run.json', snapshot)
         return (folder, snapshot), None
     def save(self, folder, snapshot): atomic_json(folder / 'run.json', snapshot)
@@ -468,6 +478,7 @@ class Engine:
             p = folder / 'spool' / row['file_id']
             if p.exists(): p.unlink()
         return {'status': 'warning' if snapshot['issues'] else 'success', 'files': len(snapshot['files']),
+                'unselected':snapshot.get('unselected',0),
                 'bytes': sum(r['size'] for r in snapshot['files']), 'uploaded_bytes': total,
                 'deleted': len(snapshot['deleted']), 'issues': snapshot['issues'], 'finished': now(),
                 'tag': snapshot['tag'], 'url': f'https://github.com/{self.c["repo"]}/releases/tag/{snapshot["tag"]}'}
@@ -477,7 +488,7 @@ class Engine:
         if snapshot['status'] == 'building': self.stage(folder, snapshot)
         if not snapshot['files'] and not snapshot['deleted']:
             snapshot['status'] = 'completed'; snapshot['finished'] = now(); self.save(folder, snapshot)
-            return {'status': 'warning' if snapshot['issues'] else 'unchanged', 'files': 0, 'issues': snapshot['issues'], 'finished': now()}
+            return {'status': 'warning' if snapshot['issues'] else 'unchanged', 'files': 0, 'issues': snapshot['issues'], 'unselected':snapshot.get('unselected',0), 'finished': now()}
         if snapshot['status'] == 'packing': self.package(folder, snapshot)
         return self.transfer(folder, snapshot)
     def run(self, deep=False):
