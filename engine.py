@@ -95,6 +95,7 @@ def exclusion(path, config, attributes=0):
     if name.endswith('.conf') and 'shadowrocket' in name: return '代理凭据'
     if 'all_users' in parts or ('nt_qq' in parts and 'global' in parts): return '聊天应用缓存'
     if attributes & 0x1000: return '未下载的云文件'
+    if attributes & 0x400: return '目录连接、链接或云占位项'
     return None
 
 class Index:

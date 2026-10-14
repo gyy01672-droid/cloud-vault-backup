@@ -1,7 +1,7 @@
 import copy,json,os,pathlib,tempfile,threading,unittest,zipfile
 from unittest.mock import Mock
 import test_backup as fixtures
-from engine import Engine,Index,BackupError,RunLock,GitHub,atomic_json,decrypt,encrypt,digest
+from engine import Engine,Index,BackupError,RunLock,GitHub,atomic_json,decrypt,encrypt,digest,exclusion
 from configuration import parse_repo,validate_config,write_key
 from restore_incremental import restore,mapped_target
 from cryptography.exceptions import InvalidTag
@@ -81,6 +81,8 @@ class SafetyTests(unittest.TestCase):
         self.assertEqual(mapped_target(out,str(f)).read_text(),'second version')
 
 class ValidationTests(unittest.TestCase):
+    def test_windows_reparse_directory_is_excluded_on_python_311(self):
+        self.assertIsNotNone(exclusion(pathlib.Path.cwd()/'linked-folder',{'exclude_paths':[]},0x400))
     def test_repo_url_and_short_name(self):
         self.assertEqual(parse_repo('https://github.com/example/private-backup.git'),'example/private-backup')
         self.assertEqual(parse_repo('example/private-backup'),'example/private-backup')
