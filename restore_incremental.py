@@ -36,9 +36,13 @@ def check_target(destination,target):
         if p==destination:break
         if p.is_symlink() or (hasattr(p,'is_junction') and p.is_junction()):raise BackupError('恢复目标不能包含符号链接或目录连接')
 
-def restore(archives, destination, key, apply=False):
+def restore(archives, destination, key, apply=False, cancel=None, temp_root=None, target_mapper=None):
+    def check():
+        if cancel is not None and cancel.is_set():
+            from engine import Paused
+            raise Paused()
     archives = Path(archives); destination = Path(destination).resolve()
-    with tempfile.TemporaryDirectory(prefix='backup-restore-') as temp:
+    with tempfile.TemporaryDirectory(prefix='backup-restore-',dir=temp_root) as temp:
         temp = Path(temp); plain = temp / 'manifest.zip'
         decrypt(archives / 'manifest.pcbackup', plain, key)
         with zipfile.ZipFile(plain) as z: plan = json.loads(z.read('snapshot.json'))
@@ -55,6 +59,7 @@ def restore(archives, destination, key, apply=False):
         names=[a['name'] for a in plan['assets']]
         if len(set(names))!=len(names):raise BackupError('重复附件名')
         for asset in plan['assets']:
+            check()
             if not re.fullmatch(r'part-[0-9]{5,}\.pcbackup',asset['name']):raise BackupError('不安全的附件名')
             source = archives / asset['name']
             if source.is_symlink() or digest(source) != asset['sha256']: raise BackupError('附件缺失或校验不匹配')
@@ -69,6 +74,7 @@ def restore(archives, destination, key, apply=False):
                     with open(output, 'r+b' if output.exists() else 'wb') as out, z.open(c['archive_path']) as inp:
                         out.seek(c['offset'])
                         for b in iter(lambda: inp.read(IO), b''):
+                            check()
                             size += len(b)
                             if size>c['size']:raise BackupError('分片超出声明大小')
                             h.update(b);out.write(b)
@@ -84,13 +90,15 @@ def restore(archives, destination, key, apply=False):
             if position != row['size'] or digest(temp / file_id) != row['sha256']: raise BackupError('完整文件哈希校验失败')
         targets = [];seen=set()
         for file_id, row in files.items():
-            target=mapped_target(destination,row['source'])
+            target=(target_mapper(row['source']) if target_mapper else mapped_target(destination,row['source']))
+            check_target(destination,target)
             identity=str(target).casefold()
             if identity in seen:raise BackupError('多个文件映射到同一恢复路径')
             seen.add(identity)
             if target.exists() and digest(target) != row['sha256'] and not apply: raise FileExistsError('需要 --apply 才能覆盖：' + str(target))
             targets.append((file_id, row, target))
         for file_id, row, target in targets:
+            check()
             target.parent.mkdir(parents=True, exist_ok=True)
             check_target(destination,target)
             fd,name=tempfile.mkstemp(dir=target.parent,prefix='.restore-');os.close(fd);staging=Path(name)

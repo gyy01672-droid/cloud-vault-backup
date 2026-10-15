@@ -75,11 +75,12 @@ class PowerGuard:
         self.active=False;self.throttle_changed=False
 
 class Worker:
-    def __init__(self, config, run_id, deep=False, engine_factory=Engine):
+    def __init__(self, config, run_id, deep=False, engine_factory=Engine, operation='backup'):
+        self.operation=operation
         self.config=config;self.run_id=run_id;self.deep=deep;self.engine_factory=engine_factory
         self.state=Path(config['state_dir']);self.state.mkdir(parents=True,exist_ok=True)
         self.cancel=threading.Event();self.stop=threading.Event();self.mutex=threading.RLock();self.power=PowerGuard()
-        self.data={'run_id':run_id,'pid':os.getpid(),'status':'running','phase':'后台任务正在启动','phase_id':0,'stats':{},'logs':[],'log_id':0,'review_id':None}
+        self.data={'run_id':run_id,'operation':operation,'pid':os.getpid(),'status':'running','phase':'后台任务正在启动','phase_id':0,'stats':{},'logs':[],'log_id':0,'review_id':None}
     def emit(self,kind,value):
         with self.mutex:
             if kind=='phase':self.data.update(phase=value,phase_id=self.data['phase_id']+1,stats={})
@@ -117,6 +118,21 @@ class Worker:
         finally:
             with self.mutex:self.data['review_id']=None
             self.data['power']=self.power.acquire()
+    def confirm_restore(self,review):
+        request_id=uuid.uuid4().hex
+        atomic_json(self.state/'restore-request.json',dict(review,run_id=self.run_id,request_id=request_id))
+        self.emit('phase','云端内容已验证 · 等待确认恢复到原位置')
+        self.emit('stats',{'stage':'restore_review','changed':review['count'],'changed_bytes':review['bytes']})
+        with self.mutex:self.data['review_id']=request_id
+        self.power.release();self.save_status()
+        try:
+            while not self.cancel.wait(.25):
+                reply=safe_read(self.state/'restore-response.json',{})
+                if reply.get('run_id')==self.run_id and reply.get('request_id')==request_id and reply.get('approved') is True:return True
+            raise Paused()
+        finally:
+            with self.mutex:self.data['review_id']=None
+            self.data['power']=self.power.acquire()
     def run(self):
         lock=WorkerLock(self.state/'background.lock')
         if not lock.acquire():return 2
@@ -126,16 +142,19 @@ class Worker:
             if os.name=='nt' and not self.data['power']['sleep_inhibited']:
                 self.emit('log','Windows 未接受防休眠请求，请检查系统电源策略。')
             self.save_status();beat=threading.Thread(target=self.heartbeat,daemon=True);beat.start()
-            engine=self.engine_factory(self.config,self.emit,self.cancel)
-            engine.select_files=self.choose
+            if self.operation=='restore':
+                from recovery import RecoveryEngine
+                engine=RecoveryEngine(self.config,self.emit,self.cancel);engine.confirm_restore=self.confirm_restore
+            else:
+                engine=self.engine_factory(self.config,self.emit,self.cancel);engine.select_files=self.choose
             value=engine.run(self.deep);terminal='done'
         except Paused:
-            terminal='paused';value='进度已保存，下次继续时会跳过已校验的分包。'
-            atomic_json(self.state/'last-report.json',{'status':'paused','finished':now(),'runs':[]})
+            terminal='paused';value='进度已保存。恢复请再次点击“一键恢复”，备份请点击“开始备份”；已校验内容会复用。'
+            if self.operation=='backup':atomic_json(self.state/'last-report.json',{'status':'paused','finished':now(),'runs':[]})
         except Exception as ex:
             value=str(ex) or type(ex).__name__
             (self.state/'last-error.log').write_text(traceback.format_exc(),encoding='utf8')
-            atomic_json(self.state/'last-report.json',{'status':'error','finished':now(),'error':value,'runs':[]})
+            if self.operation=='backup':atomic_json(self.state/'last-report.json',{'status':'error','finished':now(),'error':value,'runs':[]})
         finally:
             self.power.release();self.stop.set()
             if beat:beat.join(timeout=3)
@@ -147,7 +166,7 @@ class Worker:
 class BackgroundClient:
     def __init__(self,config_path,state):
         self.config_path=Path(config_path).resolve();self.state=Path(state);self.process=None;self.run_id=None
-    def start(self,deep=False):
+    def start(self,deep=False,operation='backup'):
         self.state.mkdir(parents=True,exist_ok=True)
         if worker_active(self.state):
             self.run_id=safe_read(self.state/'worker-status.json',{}).get('run_id');return False
@@ -156,6 +175,7 @@ class BackgroundClient:
         if os.name=='nt' and executable.name.lower()=='python.exe' and executable.with_name('pythonw.exe').exists():
             executable=executable.with_name('pythonw.exe')
         command=[str(executable),str(Path(__file__).resolve()),'--config',str(self.config_path),'--run-id',self.run_id]
+        if operation=='restore':command+=['--operation','restore']
         if deep:command.append('--deep')
         options={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL,'close_fds':True}
         if os.name=='nt':options['creationflags']=subprocess.DETACHED_PROCESS|subprocess.CREATE_NEW_PROCESS_GROUP
@@ -169,10 +189,13 @@ class BackgroundClient:
     def pause(self):atomic_json(self.state/'worker-command.json',{'run_id':self.run_id,'command':'pause'})
     def approve(self,request_id,selected):
         atomic_json(self.state/'selection-response.json',{'run_id':self.run_id,'request_id':request_id,'selected':list(selected)})
+    def approve_restore(self,request_id):
+        atomic_json(self.state/'restore-response.json',{'run_id':self.run_id,'request_id':request_id,'approved':True})
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',required=True,type=Path);parser.add_argument('--run-id',required=True);parser.add_argument('--deep',action='store_true')
+    parser.add_argument('--operation',choices=['backup','restore'],default='backup')
     args=parser.parse_args();config=load_config(args.config)
-    return Worker(config,args.run_id,args.deep).run()
+    return Worker(config,args.run_id,args.deep,operation=args.operation).run()
 
 if __name__=='__main__':raise SystemExit(main())

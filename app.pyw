@@ -9,6 +9,7 @@ try:
     from engine import BackupError, read_json
     from background import BackgroundClient, worker_active, safe_read
     from selection import FileSelection
+    from recovery_ui import RestoreReview
 except ImportError:
     if os.name=='nt':ctypes.windll.user32.MessageBoxW(None,'缺少 Python 组件。请先运行 install.ps1 安装依赖。','云端保险箱 · 启动失败',16)
     raise SystemExit(1)
@@ -63,6 +64,7 @@ class Window:
     def __init__(self, preview=False, config=None, config_path=None):
         self.config = config or {'repo':'example/private-backup','roots':[], 'state_dir':str(app_home()/'preview')}
         self.running = False; self.stats = {}; self.preview = preview
+        self.operation='backup'
         self.closing=False;self.client=None;self.config_path=config_path;self.selection_window=None;self.last_review=None
         self.backend_phase=-1;self.backend_log=0;self.last_backend_poll=0;self.started_at=0
         self.eta_meter=UploadEstimate();self.last_refresh=0
@@ -92,7 +94,7 @@ class Window:
         self.bar=ttk.Progressbar(top,style='Cloud.Horizontal.TProgressbar',maximum=100);self.bar.pack(fill='x')
         self.progress_text=tk.StringVar(value='正在初始化');tk.Label(top,textvariable=self.progress_text,fg=TEAL,bg=CARD).pack(anchor='w',pady=(9,0))
         cards=tk.Frame(self.root,bg=BG);cards.pack(fill='x',padx=32,pady=(0,15));self.values={}
-        for col,(key,label,value) in enumerate([('files','变动文件','—'),('bytes','本次数据','—'),('speed','上传速度','—'),('eta','预计剩余','测算中')]):
+        for col,(key,label,value) in enumerate([('files','本次文件','—'),('bytes','本次数据','—'),('speed','传输速度','—'),('eta','预计剩余','测算中')]):
             cards.columnconfigure(col,weight=1,uniform='cards');f=tk.Frame(cards,bg=CARD,padx=14,pady=12);f.grid(row=0,column=col,sticky='nsew',padx=(0,8) if col<3 else 0)
             tk.Label(f,text=label,bg=CARD,fg=MUTED,font=('Microsoft YaHei UI',9)).pack(anchor='w')
             var=tk.StringVar(value=value);self.values[key]=var
@@ -108,6 +110,7 @@ class Window:
         tk.Button(options,text='查看备份范围',command=self.scope,bg=BG,fg=MUTED,relief='flat',activebackground=CARD,activeforeground=TEXT,cursor='hand2').pack(side='right')
         actions=tk.Frame(self.root,bg=BG);actions.pack(fill='x',padx=32,pady=(3,14))
         self.button=tk.Button(actions,text='暂停备份',command=self.toggle,bg=TEAL,fg=BG,activebackground='#78ead7',relief='flat',padx=22,pady=9,font=('Microsoft YaHei UI',11,'bold'),cursor='hand2');self.button.pack(side='left')
+        self.restore_button=tk.Button(actions,text='一键恢复',command=self.start_restore,bg='#20324c',fg=TEXT,relief='flat',padx=15,pady=10,cursor='hand2');self.restore_button.pack(side='left',padx=(10,0))
         for label,command in [('打开私密仓库',lambda:webbrowser.open('https://github.com/'+self.config['repo']+'/releases')),('查看本次报告',self.report)]:
             tk.Button(actions,text=label,command=command,bg='#20324c',fg=TEXT,activebackground='#2a4262',activeforeground=TEXT,relief='flat',padx=15,pady=10,cursor='hand2').pack(side='left',padx=(10,0))
         tk.Label(self.root,text='AES-256 加密  ·  分包续传  ·  上传后核对 SHA-256  ·  保留历史版本',bg=BG,fg=MUTED,font=('Microsoft YaHei UI',8)).pack(pady=(0,14))
@@ -117,18 +120,23 @@ class Window:
         else:self.root.after(700,self.start)
     def log(self,text):
         self.logbox.configure(state='normal');self.logbox.insert('end',time.strftime('%H:%M:%S')+'  '+text+'\n');self.logbox.see('end');self.logbox.configure(state='disabled')
-    def start(self):
+    def start_restore(self):
+        if self.running:
+            messagebox.showinfo('请先暂停当前任务','备份与恢复不能同时写入数据。请先暂停当前任务，再点击一键恢复。',parent=self.root);return
+        if messagebox.askyesno('下载并准备恢复','将下载已完成的云端备份、解密并校验内容。\n\n准备完成后会显示原路径和同名文件处理方案，再确认才写回文件。下载与解密缓存会占用本地空间。\n\n开始准备？',parent=self.root):self.start('restore')
+    def start(self,operation='backup'):
         if self.running:return
         if not self.config_path:
             messagebox.showinfo('预览模式','这是界面预览，请正常启动程序以配置备份。',parent=self.root);return
-        self.running=True;self.stats={};self.eta_meter=UploadEstimate();self.button.configure(text='暂停备份',state='normal');self.check.configure(state='disabled')
+        self.operation=operation
+        self.running=True;self.stats={};self.eta_meter=UploadEstimate();self.button.configure(text='暂停任务',state='normal');self.check.configure(state='disabled')
         self.backend_phase=-1;self.backend_log=0;self.last_review=None;self.started_at=time.monotonic()
         self.bar.configure(mode='indeterminate');self.bar.start(12);deep=self.deep.get()
         try:
             self.client=BackgroundClient(self.config_path,self.config['state_dir'])
-            created=self.client.start(deep)
+            created=self.client.start(deep,operation)
             self.phase.set('独立后台任务已启动' if created else '已连接正在运行的后台任务')
-            self.log('最小化窗口后继续扫描和上传；扫描完成后需确认文件选择。')
+            self.log('最小化后后台继续运行；文件选择或原位恢复需要在窗口中确认。')
         except Exception as ex:self.finish('error',str(ex))
     def toggle(self):
         if self.running:
@@ -147,6 +155,7 @@ class Window:
         if value['phase_id']!=self.backend_phase:
             self.backend_phase=value['phase_id'];self.stats={};self.eta_meter=UploadEstimate();self.phase.set(value['phase'])
             self.values['eta'].set('测算中');self.values['speed'].set('—');self.log(value['phase'])
+        self.operation=value.get('operation','backup')
         for number,line in value.get('logs',[]):
             if number>self.backend_log:self.log(line);self.backend_log=number
         self.stats.update(value.get('stats',{}))
@@ -155,10 +164,10 @@ class Window:
             self.finish(value['status'],value['result']);return
         request_id=value.get('review_id')
         if request_id and request_id!=self.last_review:
-            request=safe_read(Path(self.config['state_dir'])/'selection-request.json',{})
+            request=safe_read(Path(self.config['state_dir'])/('restore-request.json' if self.operation=='restore' else 'selection-request.json'),{})
             if request.get('run_id')==self.client.run_id and request.get('request_id')==request_id:
                 self.last_review=request_id;self.root.deiconify();self.root.lift()
-                self.selection_window=FileSelection(self.root,request,self.client.approve,self.toggle)
+                self.selection_window=(RestoreReview(self.root,request,self.client.approve_restore,self.toggle) if self.operation=='restore' else FileSelection(self.root,request,self.client.approve,self.toggle))
         age=time.time()-value.get('heartbeat',0)
         if age>5:
             if not worker_active(self.config['state_dir']):
@@ -176,27 +185,31 @@ class Window:
         s=self.stats
         if 'changed' in s:self.values['files'].set(f'{s["changed"]:,} 个')
         if 'changed_bytes' in s:self.values['bytes'].set(size(s['changed_bytes']))
-        if s.get('stage')!='upload' and 'estimate' in s:
+        if s.get('stage') not in ('upload','download') and 'estimate' in s:
             self.values['eta'].set('约 '+duration(s['estimate']))
             self.detail.set('这是按历史速度粗估的上传耗时；文件准备完成后，将按实际速度动态更新。')
-        if s.get('stage')=='review':
+        if s.get('stage')=='restore_review':
+            self.bar.stop();self.values['eta'].set('等待确认');self.values['speed'].set('—')
+            self.detail.set('云端内容已验证，请检查恢复位置。确认后才写回文件，同名不同内容的本地文件会先保留副本。')
+            self.progress_text.set('等待确认恢复到原位置')
+        elif s.get('stage')=='review':
             self.bar.stop();self.values['eta'].set('等待选择');self.values['speed'].set('—')
             self.detail.set('请在文件选择窗口勾选本次要上传的内容。确认前不会封包上传。')
             self.progress_text.set('扫描完成 · 等待你的确认')
-        elif s.get('stage')=='upload':
+        elif s.get('stage') in ('upload','download'):
             _,eta,status=self.eta_meter.read(s.get('total',0),s.get('uploaded',0),s.get('inflight',0),s.get('retrying',False))
             rate=self.eta_meter.speed()
             self.values['speed'].set(size(rate)+'/s')
             self.values['eta'].set(status or duration(eta))
             self.bar.stop();self.bar.configure(mode='determinate');total=max(s.get('total',1),1)
             self.bar['value']=min(99.9,(s.get('uploaded',0)+s.get('inflight',0))/total*100)
-            self.detail.set('独立后台进程正在上传，最小化不会暂停。速度每秒更新；剩余时间按近 15 秒均速估算。')
+            self.detail.set(('正在下载云端备份' if s.get('stage')=='download' else '独立后台进程正在上传')+'，最小化不会暂停。速度每秒更新；剩余时间按近 15 秒均速估算。')
             self.progress_text.set(f'已校验 {size(s.get("uploaded",0))} / {size(total)}   ·   当前包 {size(s.get("inflight",0))}')
         elif 'packed' in s:self.progress_text.set(f'已加密并校验 {s["packed"]} / {s["pack_total"]} 个分包')
         elif 'staged' in s:self.progress_text.set(f'已处理 {s["staged"]:,} / {s["stage_total"]:,} 个候选变动文件')
         elif 'scanned' in s:self.progress_text.set(f'已扫描 {s["scanned"]:,} 个文件')
     def finish(self,kind,value):
-        self.running=False;self.bar.stop();self.button.configure(text='继续 / 再次检查',state='normal');self.check.configure(state='normal')
+        self.running=False;self.bar.stop();self.button.configure(text='开始备份',state='normal');self.check.configure(state='normal')
         self.values['speed'].set('—')
         if self.selection_window:
             try:self.selection_window.window.destroy()
@@ -204,6 +217,13 @@ class Window:
             self.selection_window=None
         self.root.title('云端保险箱 · '+('备份完成' if kind=='done' else '任务已暂停或未完成'))
         if not self.closing and not self.preview:self.root.deiconify();self.root.lift()
+        if kind=='done' and isinstance(value,dict) and value.get('operation')=='restore':
+            issues=len(value['issues']);message=f'已恢复 {value["files"]:,} 个文件；内容相同跳过 {value["unchanged"]:,} 个。\n保留本地副本 {len(value["preserved"]):,} 个；待处理 {issues:,} 项。'
+            self.root.title('云端保险箱 · 恢复结果');self.phase.set('恢复结束 · 有待处理项' if issues else '恢复完成');self.detail.set(message)
+            self.values['eta'].set('已结束');self.values['files'].set(f'{value["files"]:,} 个');self.bar.configure(mode='determinate');self.bar['value']=100
+            self.progress_text.set('详情见恢复报告；未成功的文件可以处理后再次恢复。');self.log(message)
+            if not self.preview and not self.closing:(messagebox.showwarning if issues else messagebox.showinfo)('恢复结果',message,parent=self.root)
+            return
         if kind=='done':
             count=sum(r.get('files',0) for r in value['runs']);issues=sum(len(r.get('issues',[])) for r in value['runs'])
             self.values['files'].set(f'{count:,} 个');self.values['eta'].set('已完成');self.bar.configure(mode='determinate');self.bar['value']=100
@@ -225,6 +245,12 @@ class Window:
         text=tk.Text(w,bg=CARD,fg=TEXT,wrap='word',font=('Microsoft YaHei UI',10),padx=16,pady=16);text.pack(fill='both',expand=True,padx=15,pady=15)
         text.insert('end','扫描以下目录及其子目录：\n\n'+'\n'.join(self.config['roots'])+'\n\n排除已识别的凭据、缓存、依赖环境和备份工具自身。删除只记录，不清理云端历史。请将恢复密钥保存在独立设备。聊天数据库是文件级副本，未保证应用内导入。\n\n配置保存在用户本地数据目录的 config.json。只修改 roots 和 exclude_paths 可调整范围；不能复用旧状态目录更换仓库或密钥。');text.configure(state='disabled')
     def report(self):
+        if self.operation=='restore':
+            path=Path(self.config['state_dir'])/'last-restore-report.json'
+            if not path.exists():messagebox.showinfo('恢复报告','尚未写回文件，当前状态请查看任务动态。',parent=self.root);return
+            r=read_json(path);lines=[f'恢复文件：{r.get("files",0)}',f'内容相同跳过：{r.get("unchanged",0)}',f'更新时间：{r.get("finished","")}','本地保留副本：']
+            lines += [x['source']+' → '+x['copy'] for x in r.get('preserved',[])]+['待处理：']+[x['source']+'\n'+x['error'] for x in r.get('issues',[])]
+            w=tk.Toplevel(self.root);w.title('恢复报告');w.geometry('850x620');t=tk.Text(w,wrap='word');t.pack(fill='both',expand=True);t.insert('end','\n'.join(lines));t.configure(state='disabled');return
         path=Path(self.config['state_dir'])/'last-report.json'
         if not path.exists():
             messagebox.showinfo('报告','尚未完成一次备份，当前进度请查看窗口中的备份动态。',parent=self.root);return
