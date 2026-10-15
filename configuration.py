@@ -12,6 +12,15 @@ from urllib.parse import urlsplit
 
 APP_NAME = 'CloudVault'
 
+def read_recovery_key(path):
+    """Bounded read: a key is 64 hexadecimal characters, never an arbitrary file."""
+    try:
+        with open(path,'rb') as f:raw=f.read(257)
+        text=raw.decode('ascii').strip()
+    except (OSError,UnicodeError):raise ValueError('无法读取密钥文件，请选择备份时保存的恢复密钥文本文件。') from None
+    if len(raw)>256 or not re.fullmatch(r'[0-9a-fA-F]{64}',text):raise ValueError('密钥格式错误：应为 64 个十六进制字符的恢复密钥文件。')
+    return bytes.fromhex(text)
+
 def app_home():
     if os.name == 'nt':
         return Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local')) / APP_NAME

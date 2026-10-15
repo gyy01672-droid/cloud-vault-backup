@@ -16,6 +16,7 @@ class FileSelection:
         self.request=request;self.files=request['files'];self.by_id={r['selection_id']:r for r in self.files}
         self.selected=set(self.by_id);self.submit_callback=submit;self.cancel_callback=cancel;self.page=0
         self.window=tk.Toplevel(parent);self.window.title('选择本次上传的文件')
+        self.window.bind('<Destroy>',self.dispose)
         scale=min(max(1.0,float(parent.tk.call('tk','scaling'))/(96/72)),(parent.winfo_screenwidth()-100)/1000,(parent.winfo_screenheight()-130)/650)
         self.window.geometry(f'{int(1000*scale)}x{int(650*scale)}');self.window.minsize(int(850*scale),int(550*scale))
         self.window.configure(bg='#0b1220');self.window.transient(parent)
@@ -54,6 +55,10 @@ class FileSelection:
         self.window.protocol('WM_DELETE_WINDOW',self.cancel);self.filter();self.window.lift()
     def filter(self):
         query=self.query.get().strip().casefold();self.filtered=[r for r in self.files if query in r['source'].casefold()];self.page=0;self.render()
+    def dispose(self,event=None):
+        if event is not None and event.widget!=self.window:return
+        self.request={};self.files=[];self.filtered=[];self.by_id={};self.selected=set()
+        self.submit_callback=None;self.cancel_callback=None
     def render(self):
         for i in self.tree.get_children():self.tree.delete(i)
         for row in self.filtered[self.page*self.PAGE_SIZE:(self.page+1)*self.PAGE_SIZE]:

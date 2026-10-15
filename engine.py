@@ -17,7 +17,7 @@ import re
 from urllib.parse import urlsplit
 import requests
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from configuration import validate_config, parse_repo
+from configuration import validate_config, parse_repo, read_recovery_key
 from cache_cleanup import clean_backup
 
 MAGIC = b'PCBK001\n'
@@ -111,6 +111,9 @@ class Index:
     def all(self):
         return {r[0]: dict(zip(('path', 'source', 'size', 'mtime_ns', 'sha256', 'tag', 'present'), r))
                 for r in self.db.execute('SELECT * FROM files')}
+    def get(self,path):
+        row=self.db.execute('SELECT * FROM files WHERE path=?',(norm(path),)).fetchone()
+        return dict(zip(('path','source','size','mtime_ns','sha256','tag','present'),row)) if row else None
     def unchanged_content(self, row):
         with self.db:
             self.db.execute('UPDATE files SET size=?,mtime_ns=? WHERE path=?',
@@ -275,7 +278,7 @@ class Engine:
         self.c = config = validate_config(config); self.emit = emit; self.cancel = cancel or threading.Event(); self.remote = remote
         self.state = Path(config['state_dir']); self.state.mkdir(parents=True, exist_ok=True)
         self.runs = self.state / 'runs'; self.runs.mkdir(exist_ok=True)
-        self.key = bytes.fromhex(Path(config['key_file']).read_text().strip())
+        self.key = read_recovery_key(config['key_file'])
         if len(self.key) != 32: raise BackupError('恢复密钥格式不正确')
         self.identity = {'repo':config['repo'].lower(), 'key_id':hashlib.sha256(self.key).hexdigest(), 'repo_id':config.get('repo_id')}
         self.index = Index(self.state / 'index.sqlite')
@@ -352,7 +355,7 @@ class Engine:
     def save(self, folder, snapshot): atomic_json(folder / 'run.json', snapshot)
     def stage(self, folder, snapshot):
         staged = {norm(r['source']): r for r in snapshot['files']}
-        old = self.index.all(); spool = folder / 'spool'; spool.mkdir(exist_ok=True)
+        spool = folder / 'spool'; spool.mkdir(exist_ok=True)
         self.emit('phase', '读取变动文件并生成安全副本')
         for row in snapshot['selected']:
             self.check(); key = norm(row['source'])
@@ -369,7 +372,7 @@ class Engine:
                 if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or size != before.st_size:
                     raise OSError('读取期间文件仍在变化，本轮跳过，下次再备份')
                 row = dict(row, size=size, mtime_ns=before.st_mtime_ns, sha256=h.hexdigest(), file_id=file_id)
-                prev = old.get(key)
+                prev = self.index.get(key)
                 if prev and prev['present'] and prev['sha256'] == row['sha256']:
                     self.index.unchanged_content(row); row['same_content'] = True
                 else: os.replace(temp, dest)
@@ -531,8 +534,12 @@ class Engine:
             if not identity:atomic_json(self.state/'identity.json',self.identity)
             # Upgrade old local indexes without rewriting remote backups.
             if not self.index.db.execute("SELECT value FROM meta WHERE key='history_tags'").fetchone():
-                completed=[read_json(p) for p in self.runs.glob('*/run.json')]
-                completed=sorted((r for r in completed if r and r.get('status')=='completed' and r.get('release_id')),key=lambda r:(r.get('created',''),r['tag']))
+                completed=[]
+                for p in self.runs.glob('*/run.json'):
+                    item=read_json(p)
+                    if item and item.get('status')=='completed' and item.get('release_id'):completed.append({'created':item.get('created',''),'tag':item['tag']})
+                    item=None
+                completed.sort(key=lambda r:(r['created'],r['tag']))
                 ordered=[r['tag'] for r in completed];older=sorted({r['tag'] for r in self.index.all().values()}-set(ordered))
                 history=list(dict.fromkeys(older+ordered))
                 with self.index.db:
@@ -545,6 +552,7 @@ class Engine:
                 if snapshot and snapshot['status'] != 'completed':
                     self.log('发现未完成备份，先恢复 ' + snapshot['tag'])
                     reports.append(self.process(folder, snapshot))
+                snapshot=None
             pending, report = self.make_snapshot(deep)
             if pending:
                 folder, snapshot = pending; reports.append(self.process(folder, snapshot))

@@ -4,7 +4,8 @@ import hashlib, json, os, re, shutil, tempfile, threading, uuid, zipfile
 from pathlib import Path, PureWindowsPath
 from urllib.parse import urlsplit
 import requests
-from configuration import protect
+from configuration import protect, read_recovery_key
+from cryptography.exceptions import InvalidTag
 from engine import BackupError, GitHub, IO, Paused, atomic_json, decrypt, digest, now, read_json
 from restore_incremental import mapped_target, check_target, restore
 from cache_cleanup import clean_restore
@@ -96,7 +97,7 @@ class RecoveryRemote(GitHub):
 class RecoveryEngine:
     def __init__(self,config,emit=lambda *a:None,cancel=None,remote=None):
         self.c=config;self.emit=emit;self.cancel=cancel or threading.Event();self.remote=remote
-        self.key=bytes.fromhex(Path(config['key_file']).read_text().strip())
+        self.key=read_recovery_key(config['key_file'])
         if len(self.key)!=32:raise BackupError('恢复密钥必须是 32 字节')
         identity=hashlib.sha256((config['repo'].lower()+':'+hashlib.sha256(self.key).hexdigest()).encode()).hexdigest()[:24]
         self.base=Path(config['state_dir'])/'restore'/identity;self.base.mkdir(parents=True,exist_ok=True)
@@ -260,6 +261,13 @@ class RecoveryEngine:
         finally:
             if temp.exists():temp.unlink()
     def run(self,deep=False):
+        try:return self._run(deep)
+        except InvalidTag:raise BackupError('解密校验失败：所选密钥不匹配，或备份内容已损坏。未将未验证内容写回原位置。') from None
+        finally:
+            if isinstance(self.remote,GitHub):self.remote.session.close()
+            self.catalog.clear();self.key=b''
+            self.confirm_restore=None
+    def _run(self,deep=False):
         review=self.prepare()
         if review['space_errors']:raise BackupError('恢复所需空间不足：'+', '.join(review['space_errors']))
         approve=getattr(self,'confirm_restore',None)

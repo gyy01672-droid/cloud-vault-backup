@@ -166,7 +166,7 @@ class Worker:
 class BackgroundClient:
     def __init__(self,config_path,state):
         self.config_path=Path(config_path).resolve();self.state=Path(state);self.process=None;self.run_id=None
-    def start(self,deep=False,operation='backup'):
+    def start(self,deep=False,operation='backup',recovery_key=None):
         self.state.mkdir(parents=True,exist_ok=True)
         if worker_active(self.state):
             self.run_id=safe_read(self.state/'worker-status.json',{}).get('run_id');return False
@@ -176,6 +176,7 @@ class BackgroundClient:
             executable=executable.with_name('pythonw.exe')
         command=[str(executable),str(Path(__file__).resolve()),'--config',str(self.config_path),'--run-id',self.run_id]
         if operation=='restore':command+=['--operation','restore']
+        if operation=='restore' and recovery_key is not None:command+=['--recovery-key',str(Path(recovery_key).resolve())]
         if deep:command.append('--deep')
         options={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.DEVNULL,'close_fds':True}
         if os.name=='nt':options['creationflags']=subprocess.DETACHED_PROCESS|subprocess.CREATE_NEW_PROCESS_GROUP
@@ -191,11 +192,19 @@ class BackgroundClient:
         atomic_json(self.state/'selection-response.json',{'run_id':self.run_id,'request_id':request_id,'selected':list(selected)})
     def approve_restore(self,request_id):
         atomic_json(self.state/'restore-response.json',{'run_id':self.run_id,'request_id':request_id,'approved':True})
+    def reap_finished(self):
+        if self.process is not None and self.process.poll() is not None:self.process=None
+        return self.process is None
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--config',required=True,type=Path);parser.add_argument('--run-id',required=True);parser.add_argument('--deep',action='store_true')
     parser.add_argument('--operation',choices=['backup','restore'],default='backup')
+    parser.add_argument('--recovery-key',type=Path)
     args=parser.parse_args();config=load_config(args.config)
+    if args.operation=='restore' and args.recovery_key:
+        from configuration import read_recovery_key
+        read_recovery_key(args.recovery_key)
+        config=dict(config,key_file=str(args.recovery_key.resolve()))
     return Worker(config,args.run_id,args.deep,operation=args.operation).run()
 
 if __name__=='__main__':raise SystemExit(main())

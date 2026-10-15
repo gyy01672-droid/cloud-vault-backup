@@ -2,9 +2,9 @@
 import ctypes, json, os, sys, time, webbrowser
 from pathlib import Path
 from collections import deque
-from configuration import app_home, load_config
+from configuration import app_home, load_config, read_recovery_key
 import tkinter as tk
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 try:
     from engine import BackupError, read_json
     from background import BackgroundClient, worker_active, safe_read
@@ -66,6 +66,7 @@ class Window:
         self.running = False; self.stats = {}; self.preview = preview
         self.operation='backup'
         self.closing=False;self.client=None;self.config_path=config_path;self.selection_window=None;self.last_review=None
+        self.retired_clients=[]
         self.backend_phase=-1;self.backend_log=0;self.last_backend_poll=0;self.started_at=0
         self.eta_meter=UploadEstimate();self.last_refresh=0
         self.root = tk.Tk(); self.root.title('云端保险箱 · GitHub 增量备份')
@@ -119,22 +120,32 @@ class Window:
         if preview: self.demo()
         else:self.root.after(700,self.start)
     def log(self,text):
-        self.logbox.configure(state='normal');self.logbox.insert('end',time.strftime('%H:%M:%S')+'  '+text+'\n');self.logbox.see('end');self.logbox.configure(state='disabled')
+        self.logbox.configure(state='normal');self.logbox.insert('end',time.strftime('%H:%M:%S')+'  '+text+'\n')
+        excess=int(self.logbox.index('end-1c').split('.')[0])-601
+        if excess>0:self.logbox.delete('1.0',f'{excess+1}.0')
+        self.logbox.see('end');self.logbox.configure(state='disabled')
     def start_restore(self):
         if self.running:
             messagebox.showinfo('请先暂停当前任务','备份与恢复不能同时写入数据。请先暂停当前任务，再点击一键恢复。',parent=self.root);return
-        if messagebox.askyesno('下载并准备恢复','将下载已完成的云端备份、解密并校验内容。\n\n准备完成后会显示原路径和同名文件处理方案，再确认才写回文件。下载与解密缓存会占用本地空间。\n\n开始准备？',parent=self.root):self.start('restore')
-    def start(self,operation='backup'):
+        configured=Path(self.config.get('key_file','recovery-key.txt'))
+        chosen=filedialog.askopenfilename(title='选择备份时保存的恢复密钥',parent=self.root,initialdir=str(configured.parent),initialfile=configured.name,filetypes=[('恢复密钥文本','*.txt'),('所有文件','*.*')])
+        if not chosen:return
+        try:read_recovery_key(chosen)
+        except ValueError as ex:messagebox.showerror('密钥文件不可用',str(ex),parent=self.root);return
+        if messagebox.askyesno('确认下载并解密',f'仓库：{self.config["repo"]}\n密钥文件：{chosen}\n\n此密钥只用于本次恢复。将下载、解密并校验云端备份，占用本地缓存空间。\n完成后先查看恢复清单，再次确认才写回原位置。\n\n开始准备？',parent=self.root):self.start('restore',recovery_key=chosen)
+    def start(self,operation='backup',recovery_key=None):
         if self.running:return
         if not self.config_path:
             messagebox.showinfo('预览模式','这是界面预览，请正常启动程序以配置备份。',parent=self.root);return
+        if operation=='restore' and recovery_key is None and not worker_active(self.config['state_dir']):self.start_restore();return
         self.operation=operation
         self.running=True;self.stats={};self.eta_meter=UploadEstimate();self.button.configure(text='暂停任务',state='normal');self.check.configure(state='disabled')
         self.backend_phase=-1;self.backend_log=0;self.last_review=None;self.started_at=time.monotonic()
         self.bar.configure(mode='indeterminate');self.bar.start(12);deep=self.deep.get()
         try:
+            if self.client and not self.client.reap_finished():self.retired_clients.append(self.client)
             self.client=BackgroundClient(self.config_path,self.config['state_dir'])
-            created=self.client.start(deep,operation)
+            created=self.client.start(deep,operation,recovery_key)
             self.phase.set('独立后台任务已启动' if created else '已连接正在运行的后台任务')
             self.log('最小化后后台继续运行；文件选择或原位恢复需要在窗口中确认。')
         except Exception as ex:self.finish('error',str(ex))
@@ -175,6 +186,9 @@ class Window:
             self.phase.set('后台进程仍在运行 · 等待状态更新')
         self.render_stats()
     def poll(self):
+        self.retired_clients=[c for c in self.retired_clients if not c.reap_finished()]
+        if not self.running and self.client:self.client.reap_finished()
+        if self.selection_window and not self.selection_window.window.winfo_exists():self.selection_window=None
         if self.running and self.client and time.monotonic()-self.last_backend_poll>=1:
             try:self.poll_backend()
             except (OSError,ValueError) as ex:self.phase.set('等待后台状态同步…')
