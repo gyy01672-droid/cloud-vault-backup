@@ -6,7 +6,7 @@ from restore_incremental import restore,mapped_target
 class FakeRemote:
     def __init__(self):self.sent={};self.uploads=0;self.fail_after=None;self.published=[];self.remote_assets={}
     def private(self):pass
-    def release(self,s):return {'id':1,'tag_name':s['tag']}
+    def release(self,s):self.current_tag=s['tag'];return {'id':1,'tag_name':s['tag']}
     def upload(self,r,a,p,cb):
         key=(r['tag_name'],a['name'])
         if key in self.sent and self.sent[key]==a['sha256']:return {'digest':'sha256:'+a['sha256']}
@@ -15,13 +15,15 @@ class FakeRemote:
         self.remote_assets[key]={'state':'uploaded','size':a['size'],'digest':'sha256:'+a['sha256']}
         return {'digest':'sha256:'+a['sha256']}
     def assets(self,r):return {name:value for (tag,name),value in self.remote_assets.items() if tag==r['tag_name']}
-    def api(self,method,path,payload=None):self.published.append(path);return {}
+    def api(self,method,path,payload=None):
+        if method=='GET':return {'id':1,'tag_name':self.current_tag,'draft':False}
+        self.published.append(path);return {}
 
 class Tests(unittest.TestCase):
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).resolve().parent,prefix='fixture-');self.base=pathlib.Path(self.tmp.name);self.src=self.base/'source';self.src.mkdir()
         self.key=self.base/'key.txt';self.key.write_text(os.urandom(32).hex());self.state=self.base/'state'
-        self.c={'state_dir':str(self.state),'key_file':str(self.key),'roots':[str(self.src)],'exclude_paths':[str(self.state)],'part_mib':1,'repo':'owner/repo'}
+        self.c={'state_dir':str(self.state),'key_file':str(self.key),'roots':[str(self.src)],'exclude_paths':[str(self.state)],'part_mib':1,'repo':'owner/repo','keep_local_cache':True}
         self.remote=FakeRemote()
     def tearDown(self):self.tmp.cleanup()
     def engine(self,cancel=None):return Engine(self.c,cancel=cancel,remote=self.remote)

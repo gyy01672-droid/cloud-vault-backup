@@ -7,6 +7,7 @@ import requests
 from configuration import protect
 from engine import BackupError, GitHub, IO, Paused, atomic_json, decrypt, digest, now, read_json
 from restore_incremental import mapped_target, check_target, restore
+from cache_cleanup import clean_restore
 
 def checked_row(row):
     if not isinstance(row,dict) or not isinstance(row.get('source'),str):raise BackupError('备份缺少原始路径，不能原位恢复')
@@ -170,6 +171,7 @@ class RecoveryEngine:
             receipt=folder/'prepared.json';saved=read_json(receipt,{})
             if saved and saved.get('fingerprint')!=fingerprint:raise BackupError('已准备的云端版本发生变化；请使用新的本地状态目录恢复')
             if saved:
+                if any(t not in tags for t in saved.get('required_tags',[])) or (saved.get('parent_tag') is not None and saved['parent_tag']!=previous):raise BackupError('恢复缓存依赖的云端版本缺失或顺序错误')
                 self.rows(saved['files']);self.downloaded+=sum(a['size'] for a in assets.values());previous=tag;continue
             self.wire=0;self.emit('phase','下载并校验备份：'+tag)
             rows=[]
@@ -180,6 +182,8 @@ class RecoveryEngine:
                     with zipfile.ZipFile(plain) as z:plan=json.loads(z.read('snapshot.json'))
                 if plan.get('version')!=2 or plan.get('tag')!=tag or plan.get('repo','').lower()!=self.c['repo'].lower():raise BackupError('备份清单与仓库或版本不匹配')
                 parent=plan.get('parent_tag')
+                required_tags=plan.get('required_tags',[])
+                if not isinstance(required_tags,list) or any(not isinstance(t,str) or t not in tags for t in required_tags):raise BackupError('完整恢复依赖的历史版本缺失')
                 if parent is not None and (parent not in tags or parent!=previous):raise BackupError('增量备份链缺失或分叉，不能宣称完整恢复')
                 for raw in plan['files']:checked_row(raw);mapped_target(self.staging,raw['source'])
                 required=2*sum(r['size'] for r in plan['files'])+sum(a['size'] for a in plan['assets'])
@@ -203,7 +207,9 @@ class RecoveryEngine:
                 for asset in sorted(assets.values(),key=lambda a:a['name']):
                     self.check();rows.extend(self.legacy(self.fetch(asset,folder)))
                 atomic_json(self.staging/'.cloud-vault-restore.json',{'tag':tag,'repo':self.c['repo']})
-            self.rows(rows);atomic_json(receipt,{'fingerprint':fingerprint,'files':rows});previous=tag
+            saved={'fingerprint':fingerprint,'files':rows}
+            if 'manifest.pcbackup' in assets:saved.update(parent_tag=plan.get('parent_tag'),required_tags=plan.get('required_tags',[]))
+            self.rows(rows);atomic_json(receipt,saved);previous=tag
         self.emit('phase','检查恢复位置、文件读写权限与可用空间')
         rows=list(self.catalog.values());issues=[];conflicts=0;identical=0;volumes={};total_bytes=sum(r['size'] for r in rows)
         for i,row in enumerate(rows):
@@ -260,7 +266,7 @@ class RecoveryEngine:
         if approve is None:raise BackupError('恢复必须先由界面确认原路径和同名文件处理方式')
         if not approve(review):raise Paused()
         self.emit('phase','正在恢复到原位置 · 同名本地文件先保留副本')
-        result={'operation':'restore','status':'success','finished':None,'files':0,'unchanged':0,'issues':[],'preserved':[],'releases':review['releases']}
+        result={'operation':'restore','status':'running','finished':None,'files':0,'unchanged':0,'issues':[],'preserved':[],'releases':review['releases']}
         report=Path(self.c['state_dir'])/'last-restore-report.json'
         for i,row in enumerate(review['files']):
             self.check()
@@ -269,7 +275,18 @@ class RecoveryEngine:
                 result['unchanged' if status=='unchanged' else 'files']+=1
                 if backup:result['preserved'].append({'source':row['source'],'copy':backup})
             except (OSError,BackupError) as ex:result['issues'].append({'source':row['source'],'error':str(ex)})
-            result['finished']=now();result['status']='warning' if result['issues'] else 'success'
+            result['finished']=now()
             atomic_json(report,result)
             self.emit('stats',{'stage':'restore_write','staged':i+1,'stage_total':len(review['files']),'changed':len(review['files']),'changed_bytes':review['bytes']})
-        result['finished']=now();atomic_json(report,result);return result
+        result['finished']=now();result['status']='warning' if result['issues'] else 'success';atomic_json(report,result)
+        if not result['issues'] and not self.c.get('keep_restore_cache',False):
+            try:
+                # Recheck installed contents before removing the only downloaded local cache.
+                for row in review['files']:
+                    self.check();target=original_target(row['source'],self.protected)
+                    if not target.is_file() or digest(target)!=row['sha256']:raise BackupError('恢复后的文件已变化，保留缓存以便重试')
+                result['cache_freed_bytes']=clean_restore(self.base,self.c['state_dir']);result['cache_cleaned']=True
+            except (OSError,ValueError,BackupError) as ex:
+                result['cleanup_error']=str(ex);self.emit('log','恢复缓存暂未清理：'+str(ex))
+            atomic_json(report,result)
+        return result

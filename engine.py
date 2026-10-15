@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 import requests
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from configuration import validate_config, parse_repo
+from cache_cleanup import clean_backup
 
 MAGIC = b'PCBK001\n'
 IO = 1024 * 1024
@@ -115,11 +116,16 @@ class Index:
             self.db.execute('UPDATE files SET size=?,mtime_ns=? WHERE path=?',
                             (row['size'], row['mtime_ns'], norm(row['source'])))
     def commit(self, snapshot):
+        history=list(dict.fromkeys(self.history()+[snapshot['tag']]))
         with self.db:
             for row in snapshot['files']: self._put(row, snapshot['tag'])
             for row in snapshot['deleted']:
                 self.db.execute('UPDATE files SET present=0,tag=? WHERE path=?', (snapshot['tag'], norm(row['source'])))
             self.db.execute("INSERT OR REPLACE INTO meta VALUES('last_tag',?)",(snapshot['tag'],))
+            self.db.execute("INSERT OR REPLACE INTO meta VALUES('history_tags',?)",(json.dumps(history),))
+    def history(self):
+        row=self.db.execute("SELECT value FROM meta WHERE key='history_tags'").fetchone()
+        return json.loads(row[0]) if row else ([self.last_tag()] if self.last_tag() else [])
     def last_tag(self):
         row=self.db.execute("SELECT value FROM meta WHERE key='last_tag'").fetchone()
         return row[0] if row else None
@@ -340,7 +346,7 @@ class Engine:
         folder = self.runs / tag; folder.mkdir()
         snapshot = {'version': 2, 'tag': tag, 'created': now(), 'status': 'building', 'selected': rows, 'deleted': deleted,
                     'issues': issues, 'files': [], 'assets': [], 'excluded': excluded, 'repo': self.c['repo'], 'key_id': self.identity['key_id'],
-                    'parent_tag':self.index.last_tag(),'unselected':unselected}
+                    'parent_tag':self.index.last_tag(),'required_tags':self.index.history(),'unselected':unselected}
         atomic_json(folder / 'run.json', snapshot)
         return (folder, snapshot), None
     def save(self, folder, snapshot): atomic_json(folder / 'run.json', snapshot)
@@ -420,6 +426,7 @@ class Engine:
         # The encrypted manifest is the restore plan. No original filenames are published in release notes.
         manifest = {k: snapshot[k] for k in ('version', 'tag', 'created', 'repo', 'files', 'deleted', 'issues')}
         if 'parent_tag' in snapshot:manifest['parent_tag']=snapshot['parent_tag']
+        if 'required_tags' in snapshot:manifest['required_tags']=snapshot['required_tags']
         manifest['assets'] = [a for a in snapshot['assets'] if a['name'] != 'manifest.pcbackup']
         plain = folder / 'packing.zip'; dest = assets_dir / 'manifest.pcbackup'
         # Rebuild even after an interrupted packing pass: repaired parts have new nonces/hashes.
@@ -470,18 +477,42 @@ class Engine:
                 raise BackupError('最终远端校验失败，未发布完成版本、未更新成功索引；可重试。')
         self.remote.api('PATCH', f'/releases/{release["id"]}', {'draft': False, 'body':
                         f'增量备份已完成。{len(snapshot["files"])} 个新增/修改文件，{len(snapshot["deleted"])} 条删除记录，{len(snapshot["issues"])} 条待检查项。所有附件已核对 SHA-256。请使用独立保管的原恢复密钥与 restore_incremental.py。历史备份不会删除。'})
+        self.verify_published(snapshot)
         self.index.commit(snapshot)
         snapshot['status'] = 'completed'; snapshot['finished'] = now(); self.save(folder, snapshot)
         atomic_json(self.state / 'speed.json', {'rate': self.rate})
-        # Remove only this run's plaintext staging files; retained encrypted parts support audit/recovery.
+        # Retain resumable data until publication, verification, index commit and checkpoint succeed.
         for row in snapshot['files']:
             p = folder / 'spool' / row['file_id']
             if p.exists(): p.unlink()
+        self.cleanup_completed(folder,snapshot,verified=True)
         return {'status': 'warning' if snapshot['issues'] else 'success', 'files': len(snapshot['files']),
                 'unselected':snapshot.get('unselected',0),
                 'bytes': sum(r['size'] for r in snapshot['files']), 'uploaded_bytes': total,
                 'deleted': len(snapshot['deleted']), 'issues': snapshot['issues'], 'finished': now(),
                 'tag': snapshot['tag'], 'url': f'https://github.com/{self.c["repo"]}/releases/tag/{snapshot["tag"]}'}
+    def verify_published(self,snapshot):
+        if self.remote is None:self.remote=GitHub(self.c,self.emit,self.cancel)
+        self.remote.private()
+        release=self.remote.api('GET','/releases/'+str(snapshot['release_id']))
+        if not release or release.get('draft') is not False or release.get('tag_name')!=snapshot['tag']:
+            raise BackupError('云端版本尚未确认发布，保留本地缓存')
+        assets=self.remote.assets(release)
+        for asset in snapshot['assets']:
+            row=assets.get(asset['name'],{})
+            if row.get('state')!='uploaded' or row.get('size')!=asset['size'] or row.get('digest')!='sha256:'+asset['sha256']:
+                raise BackupError('云端附件不完整，保留本地缓存')
+    def cleanup_completed(self,folder,snapshot,verified=False):
+        if self.c.get('keep_local_cache',False) or snapshot.get('cache_cleaned'):return
+        if snapshot.get('status')!='completed' or not snapshot.get('assets') or not snapshot.get('release_id'):return
+        if snapshot.get('repo','').lower()!=self.c['repo'].lower():raise BackupError('拒绝清理其他仓库的缓存')
+        if not verified:self.verify_published(snapshot)
+        try:
+            freed=clean_backup(folder,self.state,snapshot)
+            snapshot.update(cache_cleaned=True,cache_freed_bytes=freed,cache_cleaned_at=now());snapshot.pop('cleanup_error',None)
+            self.save(folder,snapshot);self.log(f'已安全清理本地备份缓存 {freed/1024**2:.1f} MiB')
+        except (OSError,ValueError) as ex:
+            snapshot['cleanup_error']=str(ex);self.save(folder,snapshot);self.log('备份已完成，缓存清理待重试：'+str(ex))
     def process(self, folder, snapshot):
         if snapshot.get('repo','').lower()!=self.c['repo'].lower() or snapshot.get('key_id',self.identity['key_id'])!=self.identity['key_id']:
             raise BackupError('未完成任务属于其他仓库或密钥，拒绝混用。')
@@ -498,8 +529,19 @@ class Engine:
             identity=read_json(self.state/'identity.json')
             if identity and identity!=self.identity:raise BackupError('此状态目录已绑定其他仓库或恢复密钥，不能直接修改配置复用。')
             if not identity:atomic_json(self.state/'identity.json',self.identity)
+            # Upgrade old local indexes without rewriting remote backups.
+            if not self.index.db.execute("SELECT value FROM meta WHERE key='history_tags'").fetchone():
+                completed=[read_json(p) for p in self.runs.glob('*/run.json')]
+                completed=sorted((r for r in completed if r and r.get('status')=='completed' and r.get('release_id')),key=lambda r:(r.get('created',''),r['tag']))
+                ordered=[r['tag'] for r in completed];older=sorted({r['tag'] for r in self.index.all().values()}-set(ordered))
+                history=list(dict.fromkeys(older+ordered))
+                with self.index.db:
+                    self.index.db.execute("INSERT OR REPLACE INTO meta VALUES('history_tags',?)",(json.dumps(history),))
+                    if history:self.index.db.execute("INSERT OR REPLACE INTO meta VALUES('last_tag',?)",(history[-1],))
             for folder in sorted(self.runs.iterdir()):
                 snapshot = read_json(folder / 'run.json')
+                if snapshot and snapshot['status']=='completed' and snapshot.get('assets') and not snapshot.get('cache_cleaned'):
+                    self.cleanup_completed(folder,snapshot)
                 if snapshot and snapshot['status'] != 'completed':
                     self.log('发现未完成备份，先恢复 ' + snapshot['tag'])
                     reports.append(self.process(folder, snapshot))

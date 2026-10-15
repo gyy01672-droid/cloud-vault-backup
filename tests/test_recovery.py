@@ -23,7 +23,7 @@ class RecoveryTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory(dir=pathlib.Path(__file__).resolve().parent,prefix='fixture-');self.base=pathlib.Path(self.temp.name)
         self.src=self.base/'source';self.src.mkdir();self.key=self.base/'key.txt';self.key.write_text(os.urandom(32).hex())
-        self.c={'state_dir':str(self.base/'state'),'key_file':str(self.key),'repo':'owner/repo','roots':[str(self.src)],'exclude_paths':[],'part_mib':1}
+        self.c={'state_dir':str(self.base/'state'),'key_file':str(self.key),'repo':'owner/repo','roots':[str(self.src)],'exclude_paths':[],'part_mib':1,'keep_local_cache':True,'keep_restore_cache':True}
         self.remote=DownloadRemote();self.upload=FakeRemote();self.keybytes=bytes.fromhex(self.key.read_text())
     def tearDown(self):self.temp.cleanup()
     def backup(self):
@@ -90,6 +90,18 @@ class RecoveryTests(unittest.TestCase):
         e=self.recovery();e.confirm_restore=lambda r:True
         with self.assertRaises(BackupError):e.run()
         self.assertEqual(list(self.src.iterdir()),[])
+    def test_cached_plan_cannot_hide_removed_history(self):
+        f=self.src/'a.txt';f.write_text('one');first=self.backup();f.write_text('version two');self.backup();f.write_text('version three');self.backup()
+        e=self.recovery();e.prepare();self.remote.items.pop(0)
+        with self.assertRaises(BackupError):self.recovery().prepare()
+        self.assertEqual(f.read_text(),'version three')
+    def test_manifest_has_original_path_and_complete_history_dependencies(self):
+        from engine import decrypt
+        f=self.src/'a.txt';f.write_text('one');first=self.backup();f.write_text('version two');second=self.backup();f.write_text('version three');third=self.backup()
+        archive=pathlib.Path(self.c['state_dir'])/'runs'/third/'assets'/'manifest.pcbackup';plain=self.base/'plan.zip';decrypt(archive,plain,self.keybytes)
+        with zipfile.ZipFile(plain) as z:plan=json.loads(z.read('snapshot.json'))
+        self.assertEqual(plan['parent_tag'],second);self.assertEqual(plan['required_tags'],[first,second]);self.assertEqual(plan['files'][0]['source'],str(f))
+        f.unlink();e=self.recovery();e.confirm_restore=lambda r:True;e.run();self.assertEqual(f.read_text(),'version three')
 
 class Response:
     def __init__(self,status,data=b'',headers=None):self.status_code=status;self.data=data;self.headers=headers or {}
