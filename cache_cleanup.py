@@ -11,9 +11,9 @@ def confined(path,root):
         if p.is_symlink() or getattr(st,'st_file_attributes',0)&0x400:raise ValueError('缓存清理拒绝链接或目录连接')
     return path
 
-def clean_backup(folder,state,snapshot):
+def clean_backup(folder,state,snapshot,discard=False):
     runs=Path(state).absolute()/'runs';folder=confined(folder,runs)
-    if folder.parent!=runs or folder.name!=snapshot['tag'] or snapshot.get('status')!='completed':raise ValueError('仅清理已完成任务的缓存')
+    if folder.parent!=runs or folder.name!=snapshot['tag'] or snapshot.get('status')!=('cancelled' if discard else 'completed'):raise ValueError('任务状态不允许清理缓存')
     candidates=[]
     for sub,pattern in [('assets',r'(?:part-[0-9]{5,}|manifest)\.pcbackup(?:\.tmp)?'),('spool',r'[0-9a-f]{64}(?:\.tmp)?')]:
         directory=confined(folder/sub,runs)

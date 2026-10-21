@@ -146,7 +146,7 @@ class Worker:
                 from recovery import RecoveryEngine
                 engine=RecoveryEngine(self.config,self.emit,self.cancel);engine.confirm_restore=self.confirm_restore
             else:
-                engine=self.engine_factory(self.config,self.emit,self.cancel);engine.select_files=self.choose
+                engine=self.engine_factory(self.config,self.emit,self.cancel);engine.select_files=self.choose;engine.confirm_capacity=self.confirm_capacity
             value=engine.run(self.deep);terminal='done'
         except Paused:
             terminal='paused';value='进度已保存。恢复请再次点击“一键恢复”，备份请点击“开始备份”；已校验内容会复用。'
@@ -162,6 +162,22 @@ class Worker:
             try:self.save_status()
             finally:lock.close()
         return 0 if terminal in {'done','paused'} else 1
+
+    def confirm_capacity(self,info):
+        request_id=uuid.uuid4().hex
+        atomic_json(self.state/'capacity-request.json',dict(info,run_id=self.run_id,request_id=request_id))
+        self.emit('phase','仓库容量提醒 · 等待确认')
+        self.emit('stats',{'stage':'capacity_review'})
+        with self.mutex:self.data.update(review_id=request_id,review_kind='capacity')
+        self.power.release();self.save_status()
+        try:
+            while not self.cancel.wait(.25):
+                reply=safe_read(self.state/'capacity-response.json',{})
+                if reply.get('run_id')==self.run_id and reply.get('request_id')==request_id:return reply.get('approved') is True
+            raise Paused()
+        finally:
+            with self.mutex:self.data.update(review_id=None,review_kind=None)
+            self.data['power']=self.power.acquire()
 
 class BackgroundClient:
     def __init__(self,config_path,state):
@@ -192,6 +208,8 @@ class BackgroundClient:
         atomic_json(self.state/'selection-response.json',{'run_id':self.run_id,'request_id':request_id,'selected':list(selected)})
     def approve_restore(self,request_id):
         atomic_json(self.state/'restore-response.json',{'run_id':self.run_id,'request_id':request_id,'approved':True})
+    def approve_capacity(self,request_id,approved):
+        atomic_json(self.state/'capacity-response.json',{'run_id':self.run_id,'request_id':request_id,'approved':approved})
     def reap_finished(self):
         if self.process is not None and self.process.poll() is not None:self.process=None
         return self.process is None

@@ -67,6 +67,7 @@ class Window:
         self.operation='backup'
         self.closing=False;self.client=None;self.config_path=config_path;self.selection_window=None;self.last_review=None
         self.retired_clients=[]
+        self.admin_busy=False
         self.backend_phase=-1;self.backend_log=0;self.last_backend_poll=0;self.started_at=0
         self.eta_meter=UploadEstimate();self.last_refresh=0
         self.root = tk.Tk(); self.root.title('云端保险箱 · GitHub 增量备份')
@@ -109,6 +110,9 @@ class Window:
         self.check=tk.Checkbutton(options,text='深度检查所有文件内容（较慢）',variable=self.deep,bg=BG,fg=MUTED,selectcolor=CARD,activebackground=BG,activeforeground=TEXT,highlightthickness=0)
         self.check.pack(side='left')
         tk.Button(options,text='查看备份范围',command=self.scope,bg=BG,fg=MUTED,relief='flat',activebackground=CARD,activeforeground=TEXT,cursor='hand2').pack(side='right')
+        from management_ui import repository_dialog,end_task
+        tk.Button(options,text='仓库管理',command=lambda:repository_dialog(self),bg=BG,fg=TEAL,relief='flat').pack(side='right',padx=6)
+        tk.Button(options,text='结束任务 / 清缓存',command=lambda:end_task(self),bg=BG,fg='#ffbd88',relief='flat').pack(side='right',padx=6)
         actions=tk.Frame(self.root,bg=BG);actions.pack(fill='x',padx=32,pady=(3,14))
         self.button=tk.Button(actions,text='暂停备份',command=self.toggle,bg=TEAL,fg=BG,activebackground='#78ead7',relief='flat',padx=22,pady=9,font=('Microsoft YaHei UI',11,'bold'),cursor='hand2');self.button.pack(side='left')
         self.restore_button=tk.Button(actions,text='一键恢复',command=self.start_restore,bg='#20324c',fg=TEXT,relief='flat',padx=15,pady=10,cursor='hand2');self.restore_button.pack(side='left',padx=(10,0))
@@ -125,6 +129,7 @@ class Window:
         if excess>0:self.logbox.delete('1.0',f'{excess+1}.0')
         self.logbox.see('end');self.logbox.configure(state='disabled')
     def start_restore(self):
+        if self.admin_busy:return
         if self.running:
             messagebox.showinfo('请先暂停当前任务','备份与恢复不能同时写入数据。请先暂停当前任务，再点击一键恢复。',parent=self.root);return
         configured=Path(self.config.get('key_file','recovery-key.txt'))
@@ -134,7 +139,7 @@ class Window:
         except ValueError as ex:messagebox.showerror('密钥文件不可用',str(ex),parent=self.root);return
         if messagebox.askyesno('确认下载并解密',f'仓库：{self.config["repo"]}\n密钥文件：{chosen}\n\n此密钥只用于本次恢复。将下载、解密并校验云端备份，占用本地缓存空间。\n完成后先查看恢复清单，再次确认才写回原位置。\n\n开始准备？',parent=self.root):self.start('restore',recovery_key=chosen)
     def start(self,operation='backup',recovery_key=None):
-        if self.running:return
+        if self.running or self.admin_busy:return
         if not self.config_path:
             messagebox.showinfo('预览模式','这是界面预览，请正常启动程序以配置备份。',parent=self.root);return
         if operation=='restore' and recovery_key is None and not worker_active(self.config['state_dir']):self.start_restore();return
@@ -150,6 +155,7 @@ class Window:
             self.log('最小化后后台继续运行；文件选择或原位恢复需要在窗口中确认。')
         except Exception as ex:self.finish('error',str(ex))
     def toggle(self):
+        if self.admin_busy:return
         if self.running:
             self.client.pause();self.phase.set('正在安全暂停…');self.button.configure(state='disabled')
         else:self.start()
@@ -175,10 +181,14 @@ class Window:
             self.finish(value['status'],value['result']);return
         request_id=value.get('review_id')
         if request_id and request_id!=self.last_review:
-            request=safe_read(Path(self.config['state_dir'])/('restore-request.json' if self.operation=='restore' else 'selection-request.json'),{})
+            capacity=value.get('review_kind')=='capacity'
+            request=safe_read(Path(self.config['state_dir'])/('capacity-request.json' if capacity else 'restore-request.json' if self.operation=='restore' else 'selection-request.json'),{})
             if request.get('run_id')==self.client.run_id and request.get('request_id')==request_id:
                 self.last_review=request_id;self.root.deiconify();self.root.lift()
-                self.selection_window=(RestoreReview(self.root,request,self.client.approve_restore,self.toggle) if self.operation=='restore' else FileSelection(self.root,request,self.client.approve,self.toggle))
+                if capacity:
+                    approved=messagebox.askyesno('仓库容量提醒',f'当前容量 {size(request["used"])}，完成本轮预计 {size(request["projected"])}。\n已达到提醒值 {size(request["soft"])}；停止值为 {size(request["hard"])}。\n\n这是软件自设预算，不是 GitHub 官方封号阈值。换仓库不能消除账号风险。\n\n忽略本仓库首次提醒并继续？选择“否”将暂停，可在仓库管理中更换仓库。',parent=self.root)
+                    self.client.approve_capacity(request_id,approved)
+                else:self.selection_window=(RestoreReview(self.root,request,self.client.approve_restore,self.toggle) if self.operation=='restore' else FileSelection(self.root,request,self.client.approve,self.toggle))
         age=time.time()-value.get('heartbeat',0)
         if age>5:
             if not worker_active(self.config['state_dir']):
@@ -280,6 +290,8 @@ class Window:
         text=tk.Text(w,bg=CARD,fg=TEXT,wrap='word',font=('Microsoft YaHei UI',10),padx=15,pady=15);text.pack(fill='both',expand=True,padx=15,pady=15)
         text.insert('end','\n'.join(lines));text.configure(state='disabled')
     def close(self):
+        if self.admin_busy:
+            messagebox.showinfo('操作进行中','正在安全停止、清理或迁移，请等待完成后退出。',parent=self.root);return
         if self.closing:return
         if self.running and not messagebox.askyesno('保存进度并退出','现在退出会暂停本轮任务。下次双击自动续传，已上传内容不会丢失。\n\n保存进度并退出？',parent=self.root):return
         if self.running and self.client:
@@ -311,7 +323,7 @@ def main():
             if config is None:return
         from engine import RunLock
         folder=Path(config['state_dir']);folder.mkdir(parents=True,exist_ok=True)
-        lock=RunLock(folder/'app.lock')
+        lock=RunLock(args.config.with_suffix('.app.lock'))
         try:lock.acquire()
         except BackupError:
             r=tk.Tk();r.withdraw();messagebox.showinfo('云端保险箱','备份窗口已经在运行，请切换到已有窗口。');r.destroy();return

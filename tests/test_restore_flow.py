@@ -108,12 +108,12 @@ class GuiTests(unittest.TestCase):
             self.assertNotIn('fixture 0\n',obj.logbox.get('1.0','end'))
         finally:obj.logbox.destroy()
     def test_picker_cancel_does_not_start_restore(self):
-        obj=Mock(running=False,config={'key_file':'key.txt','repo':'owner/repo'},root=self.root)
+        obj=Mock(running=False,admin_busy=False,config={'key_file':'key.txt','repo':'owner/repo'},root=self.root)
         with patch('tkinter.filedialog.askopenfilename',return_value=''):
             self.module['Window'].start_restore(obj)
         obj.start.assert_not_called()
     def test_picker_validates_then_confirms_task_key(self):
-        obj=Mock(running=False,config={'key_file':'key.txt','repo':'owner/repo'},root=self.root)
+        obj=Mock(running=False,admin_busy=False,config={'key_file':'key.txt','repo':'owner/repo'},root=self.root)
         with patch('tkinter.filedialog.askopenfilename',return_value='selected.txt'),patch.dict(self.module['Window'].start_restore.__globals__,read_recovery_key=Mock()),patch('tkinter.messagebox.askyesno',return_value=True):
             self.module['Window'].start_restore(obj)
         obj.start.assert_called_once_with('restore',recovery_key='selected.txt');self.assertEqual(obj.config['key_file'],'key.txt')

@@ -106,6 +106,8 @@ class RecoveryEngine:
         self.downloads=self.base/'downloads';self.downloads.mkdir(exist_ok=True)
         self.catalog={};self.wire=0;self.total=0;self.downloaded=0
         self.protected=[config['state_dir'],config['key_file'],str(Path(__file__).resolve().parent)]
+        self.protected += [r['state_dir'] for r in config.get('repository_history',[]) if r.get('state_dir')]
+        if config.get('profile_root'):self.protected.append(config['profile_root'])
     def check(self):
         if self.cancel.is_set():raise Paused()
     def stagepath(self,source):
@@ -156,7 +158,22 @@ class RecoveryEngine:
                         if Path(name).exists():Path(name).unlink()
                 return rows
     def prepare(self):
-        if self.remote is None:self.remote=RecoveryRemote(self.c,self.emit,self.cancel)
+        from history_remote import HistoryRemote,checked_chain
+        if self.remote is None:
+            self.remote=HistoryRemote(self.c,self.emit,self.cancel)
+            # Discover portable history from the newest authenticated manifest, before applying any version.
+            for release in reversed(self.remote.current_releases()):
+                assets=self.remote.assets(release)
+                if 'manifest.pcbackup' not in assets:continue
+                folder=self.downloads/str(int(release['id']));folder.mkdir(exist_ok=True);no_links(folder)
+                manifest=self.fetch(assets['manifest.pcbackup'],folder)
+                with tempfile.TemporaryDirectory(dir=self.base) as temp:
+                    plain=Path(temp)/'history.zip';decrypt(manifest,plain,self.key)
+                    with zipfile.ZipFile(plain) as z:plan=json.loads(z.read('snapshot.json'))
+                if plan.get('repo','').lower()!=self.c['repo'].lower() or plan.get('tag')!=release['tag_name']:raise BackupError('历史清单与当前仓库不匹配')
+                if plan.get('repositories'):self.remote.adopt(plan['repositories'])
+                break
+            self.downloaded=0;self.wire=0
         self.remote.private();self.emit('phase','读取云端完整备份与历次增量备份')
         releases=[]
         for release in self.remote.releases():
@@ -164,6 +181,7 @@ class RecoveryEngine:
             if assets:releases.append((release,assets))
         if not releases:raise BackupError('没有找到已完成的加密备份；上传中的版本不会用于恢复')
         self.total=sum(a['size'] for _,assets in releases for a in assets.values());tags={r['tag_name'] for r,_ in releases}
+        if len(tags)!=len(releases):raise BackupError('跨仓库出现重复备份版本，已停止恢复')
         previous=None
         for release,assets in releases:
             self.check();tag=release['tag_name']
@@ -181,7 +199,13 @@ class RecoveryEngine:
                 with tempfile.TemporaryDirectory(dir=self.base) as temp:
                     plain=Path(temp)/'manifest.zip';decrypt(manifest,plain,self.key)
                     with zipfile.ZipFile(plain) as z:plan=json.loads(z.read('snapshot.json'))
-                if plan.get('version')!=2 or plan.get('tag')!=tag or plan.get('repo','').lower()!=self.c['repo'].lower():raise BackupError('备份清单与仓库或版本不匹配')
+                expected_repo=release.get('_repo',self.c['repo'])
+                if plan.get('version')!=2 or plan.get('tag')!=tag or plan.get('repo','').lower()!=expected_repo.lower():raise BackupError('备份清单与仓库或版本不匹配')
+                if plan.get('repositories') and isinstance(self.remote,HistoryRemote):
+                    required=checked_chain(plan['repositories'],expected_repo)
+                    actual=self.remote.chain[:len(required)]
+                    if [r['repo'].lower() for r in required]!=[r['repo'].lower() for r in actual]:raise BackupError('恢复所需的仓库历史缺失或顺序错误')
+                    if any(r.get('repo_id') is not None and r['repo_id']!=a.get('repo_id') for r,a in zip(required,actual)):raise BackupError('恢复仓库身份不一致')
                 parent=plan.get('parent_tag')
                 required_tags=plan.get('required_tags',[])
                 if not isinstance(required_tags,list) or any(not isinstance(t,str) or t not in tags for t in required_tags):raise BackupError('完整恢复依赖的历史版本缺失')
@@ -265,6 +289,8 @@ class RecoveryEngine:
         except InvalidTag:raise BackupError('解密校验失败：所选密钥不匹配，或备份内容已损坏。未将未验证内容写回原位置。') from None
         finally:
             if isinstance(self.remote,GitHub):self.remote.session.close()
+            from history_remote import HistoryRemote
+            if isinstance(self.remote,HistoryRemote):self.remote.close()
             self.catalog.clear();self.key=b''
             self.confirm_restore=None
     def _run(self,deep=False):

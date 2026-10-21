@@ -25,7 +25,7 @@ if (-not (Get-Command gh -ErrorAction SilentlyContinue) -and -not (Test-Path -Li
 $appDir = Join-Path $InstallDirectory 'app'
 $runtimeDir = Join-Path $InstallDirectory 'runtime'
 New-Item -ItemType Directory -Path $appDir -Force | Out-Null
-$files = @('app.pyw','engine.py','cache_cleanup.py','background.py','selection.py','recovery.py','recovery_ui.py','configuration.py','onboarding.py','restore_incremental.py','backup.ico','backup.png','requirements.txt','README.md','SECURITY.md','LICENSE')
+$files = @('staging.py','capacity.py','repositories.py','history_remote.py','task_cleanup.py','management_ui.py','app.pyw','engine.py','cache_cleanup.py','background.py','selection.py','recovery.py','recovery_ui.py','configuration.py','onboarding.py','restore_incremental.py','backup.ico','backup.png','requirements.txt','README.md','SECURITY.md','LICENSE')
 foreach ($name in $files) {
     $from = Join-Path $sourceDir $name
     $to = Join-Path $appDir $name

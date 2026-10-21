@@ -80,6 +80,9 @@ def validate_config(config):
         raise ValueError('备份目录必须是绝对路径。')
     if type(c.get('part_mib', 64)) is not int or not 1 <= c.get('part_mib', 64) <= 512:
         raise ValueError('分包大小必须介于 1 和 512 MiB。')
+    if type(c.get('stage_workers',4)) is not int or not 1<=c.get('stage_workers',4)<=8:raise ValueError('并行读取路数必须为 1–8。')
+    soft=c.get('capacity_soft_gib',20);hard=c.get('capacity_hard_gib',30)
+    if isinstance(soft,bool) or isinstance(hard,bool) or not isinstance(soft,(int,float)) or not isinstance(hard,(int,float)) or not 0<soft<hard<100000:raise ValueError('容量阈值必须满足 0 < 提醒值 < 停止值。')
     c['exclude_paths'] = list(dict.fromkeys(c.get('exclude_paths', []) + [c['state_dir'], c['key_file'], str(app_home())]))
     return c
 

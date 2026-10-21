@@ -350,44 +350,14 @@ class Engine:
         snapshot = {'version': 2, 'tag': tag, 'created': now(), 'status': 'building', 'selected': rows, 'deleted': deleted,
                     'issues': issues, 'files': [], 'assets': [], 'excluded': excluded, 'repo': self.c['repo'], 'key_id': self.identity['key_id'],
                     'parent_tag':self.index.last_tag(),'required_tags':self.index.history(),'unselected':unselected}
+        from repositories import repository_chain
+        snapshot['repositories']=[{k:r[k] for k in ('repo','repo_id') if r.get(k) is not None} for r in repository_chain(self.c)]
         atomic_json(folder / 'run.json', snapshot)
         return (folder, snapshot), None
     def save(self, folder, snapshot): atomic_json(folder / 'run.json', snapshot)
     def stage(self, folder, snapshot):
-        staged = {norm(r['source']): r for r in snapshot['files']}
-        spool = folder / 'spool'; spool.mkdir(exist_ok=True)
-        self.emit('phase', '读取变动文件并生成安全副本')
-        for row in snapshot['selected']:
-            self.check(); key = norm(row['source'])
-            if key in staged: continue
-            file_id = hashlib.sha256(key.encode()).hexdigest()
-            dest = spool / file_id; temp = spool / (file_id + '.tmp')
-            try:
-                p = Path(row['source']); before = p.stat(); h = hashlib.sha256(); size = 0
-                if shutil.disk_usage(folder).free < before.st_size + 128 * IO: raise OSError('本地可用空间不足，未修改原文件')
-                with open(p, 'rb') as inp, open(temp, 'wb') as out:
-                    for b in iter(lambda: inp.read(IO), b''):
-                        self.check(); out.write(b); h.update(b); size += len(b)
-                after = p.stat()
-                if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or size != before.st_size:
-                    raise OSError('读取期间文件仍在变化，本轮跳过，下次再备份')
-                row = dict(row, size=size, mtime_ns=before.st_mtime_ns, sha256=h.hexdigest(), file_id=file_id)
-                prev = self.index.get(key)
-                if prev and prev['present'] and prev['sha256'] == row['sha256']:
-                    self.index.unchanged_content(row); row['same_content'] = True
-                else: os.replace(temp, dest)
-                snapshot['files'].append(row); staged[key] = row
-                self.save(folder, snapshot)
-                self.emit('stats', {'staged': len(staged), 'stage_total': len(snapshot['selected'])})
-            except Paused: raise
-            except OSError as ex:
-                snapshot['issues'].append({'source': row['source'], 'error': str(ex)})
-                snapshot.setdefault('failed_sources', []).append(row['source'])
-                self.log('暂未备份：' + Path(row['source']).name)
-            finally:
-                if temp.exists(): temp.unlink()
-        snapshot['files'] = [r for r in snapshot['files'] if not r.get('same_content')]
-        snapshot['status'] = 'packing'; self.save(folder, snapshot)
+        from staging import stage_files
+        stage_files(self,folder,snapshot)
     def package(self, folder, snapshot):
         limit = self.c.get('part_mib', 64) * IO
         self.emit('phase', '加密分包 · 校验可恢复性')
@@ -402,6 +372,7 @@ class Engine:
             if group and (total + c['size'] > limit or len(group) >= 1000): groups.append(group); group = []; total = 0
             group.append(c); total += c['size']
         if group: groups.append(group)
+        if len(groups)>999:raise BackupError('本轮分包超过单个 Release 的附件上限，请结束任务后减少选择范围。')
         assets_dir = folder / 'assets'; assets_dir.mkdir(exist_ok=True)
         existing = {a['name']: a for a in snapshot['assets']}
         for number, group in enumerate(groups, 1):
@@ -430,6 +401,7 @@ class Engine:
         manifest = {k: snapshot[k] for k in ('version', 'tag', 'created', 'repo', 'files', 'deleted', 'issues')}
         if 'parent_tag' in snapshot:manifest['parent_tag']=snapshot['parent_tag']
         if 'required_tags' in snapshot:manifest['required_tags']=snapshot['required_tags']
+        if 'repositories' in snapshot:manifest['repositories']=snapshot['repositories']
         manifest['assets'] = [a for a in snapshot['assets'] if a['name'] != 'manifest.pcbackup']
         plain = folder / 'packing.zip'; dest = assets_dir / 'manifest.pcbackup'
         # Rebuild even after an interrupted packing pass: repaired parts have new nonces/hashes.
@@ -447,7 +419,11 @@ class Engine:
         verify.unlink(); plain.unlink()
     def transfer(self, folder, snapshot):
         if self.remote is None: self.remote = GitHub(self.c, self.emit, self.cancel)
-        self.remote.private(); release = self.remote.release(snapshot)
+        self.remote.private()
+        if isinstance(self.remote,GitHub):
+            from capacity import enforce
+            enforce(self,snapshot)
+        self.check();release = self.remote.release(snapshot)
         # Store the release identity so a lost response never advances the local index.
         snapshot['release_id'] = release['id']; self.save(folder, snapshot)
         total = sum(a['size'] for a in snapshot['assets']); completed = 0; wire_bytes = 0
@@ -549,6 +525,7 @@ class Engine:
                 snapshot = read_json(folder / 'run.json')
                 if snapshot and snapshot['status']=='completed' and snapshot.get('assets') and not snapshot.get('cache_cleaned'):
                     self.cleanup_completed(folder,snapshot)
+                if snapshot and snapshot['status']=='cancelled':continue
                 if snapshot and snapshot['status'] != 'completed':
                     self.log('发现未完成备份，先恢复 ' + snapshot['tag'])
                     reports.append(self.process(folder, snapshot))
